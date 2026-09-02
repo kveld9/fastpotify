@@ -357,6 +357,12 @@ impl<T> SparseList<T> {
     }
 
     pub fn is_missing(&self, page_idx: usize) -> bool {
+        if let Some(total) = self.total {
+            let num_pages = (total as usize).div_ceil(PLAYLIST_PAGE_SIZE);
+            if page_idx >= num_pages {
+                return false;
+            }
+        }
         self.pages.get(page_idx).is_none_or(|p| p.is_none())
     }
 
@@ -1219,5 +1225,23 @@ mod tests {
         list.reorder(0, 301);
         assert_eq!(list.loaded_count, 0);
         assert!(!list.loaded_once);
+    }
+
+    #[test]
+    fn sparse_list_zero_total_and_out_of_bounds_queries() {
+        let mut list: SparseList<String> = SparseList::new();
+        list.set_total(0);
+        assert_eq!(list.get(0), None);
+        assert_eq!(list.get(100), None);
+        assert!(!list.is_missing(0));
+        assert!(!list.is_missing(5));
+
+        list.set_total(250);
+        // Pages 0, 1, 2 exist; page 3+ is out of bounds
+        assert!(list.is_missing(0));
+        assert!(list.is_missing(1));
+        assert!(list.is_missing(2));
+        assert!(!list.is_missing(3));
+        assert!(!list.is_missing(1000));
     }
 }
