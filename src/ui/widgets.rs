@@ -1616,6 +1616,51 @@ pub fn loading_row(ui: &mut Ui, palette: &Palette) {
     });
 }
 
+pub fn skeleton_track_row(
+    ui: &mut Ui,
+    palette: &Palette,
+    row_height: f32,
+    number: usize,
+    show_cover: bool,
+) {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), row_height), Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let painter = ui.painter();
+    let num_text = (number + 1).to_string();
+    painter.text(
+        pos2(rect.left() + 24.0, rect.center().y),
+        egui::Align2::RIGHT_CENTER,
+        num_text,
+        theme::regular(13.0),
+        palette.dim.gamma_multiply(0.4),
+    );
+    let mut x = rect.left() + 36.0;
+    if show_cover {
+        let cover_size = (row_height - 12.0).clamp(16.0, 40.0);
+        let cover_rect = Rect::from_min_size(
+            pos2(x + 4.0, rect.top() + (row_height - cover_size) / 2.0),
+            vec2(cover_size, cover_size),
+        );
+        painter.rect_filled(
+            cover_rect,
+            CornerRadius::same(4),
+            palette.surface.gamma_multiply(0.5),
+        );
+        x += cover_size + 12.0;
+    }
+    let bar_rect = Rect::from_min_size(
+        pos2(x + 8.0, rect.center().y - 6.0),
+        vec2((ui.available_width() * 0.25).clamp(80.0, 240.0), 12.0),
+    );
+    painter.rect_filled(
+        bar_rect,
+        CornerRadius::same(3),
+        palette.surface.gamma_multiply(0.3),
+    );
+}
+
 pub fn error_row(ui: &mut Ui, app: &mut App, message: &str, retry: Option<Page>) {
     let palette = app.palette;
     ui.horizontal(|ui| {

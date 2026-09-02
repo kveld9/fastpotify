@@ -215,6 +215,25 @@ pub fn actions_row(
                 app.actions.push(Action::ToggleSaved(uri.clone()));
             }
         }
+        if let Some(uri) = &actions.play_uri
+            && app.playing_context_uri().as_deref() == Some(uri.as_str())
+        {
+            if app.playlist_locator.is_active() {
+                theme::spinner(ui, 16.0, palette.accent);
+                theme::text(ui, "Locating song...", theme::regular(13.0), palette.dim);
+            } else if theme::icon_button(
+                ui,
+                Icon::AudioLines,
+                26.0,
+                palette.accent,
+                palette.text,
+                "Jump to playing song",
+            )
+            .clicked()
+            {
+                app.actions.push(Action::JumpToPlayingTrack);
+            }
+        }
         if let Some(uri) = &actions.play_uri {
             let more = theme::icon_button(
                 ui,
@@ -258,6 +277,11 @@ pub type TableItem = (PlayableItem, Option<String>, Option<String>);
 /// A track table with virtualised rows and paging.
 pub struct Table<'a> {
     pub items: &'a [TableItem],
+    pub sparse: Option<(
+        &'a crate::model::SparseList<crate::api::models::PlaylistItem>,
+        Option<&'a str>,
+        &'a str,
+    )>,
     pub context: RowContext,
     pub show_album: bool,
     pub show_cover: bool,
@@ -344,7 +368,13 @@ pub fn table(app: &mut App, ui: &mut egui::Ui, table: Table<'_>) {
         theme::ROW_HEIGHT
     };
 
-    if !table.items.is_empty()
+    let has_items = if let Some((sparse, ..)) = table.sparse {
+        sparse.total.is_some_and(|tot| tot > 0) || sparse.loaded_count > 0
+    } else {
+        !table.items.is_empty()
+    };
+
+    if has_items
         && let Some(column) = widgets::table_header(
             ui,
             &palette,
@@ -399,9 +429,15 @@ pub fn table(app: &mut App, ui: &mut egui::Ui, table: Table<'_>) {
     } else {
         table.context.clone()
     };
+
+    let rows = if let Some((sparse, ..)) = table.sparse {
+        sparse.total.unwrap_or(sparse.loaded_count as u32) as usize
+    } else {
+        entry.visible.len()
+    };
     let sorted = sort.is_some();
     // Allow playlist reordering only when displayed rows match server order.
-    let move_playlist = (sort.is_none() && needle.is_empty())
+    let move_playlist = (table.sparse.is_some() || (sort.is_none() && needle.is_empty()))
         .then(|| match &table.context {
             RowContext::Context {
                 editable_playlist: Some((id, _)),
@@ -424,27 +460,47 @@ pub fn table(app: &mut App, ui: &mut egui::Ui, table: Table<'_>) {
             .pointer_latest_pos()
             .filter(|pos| ui.clip_rect().contains(*pos))?;
         let row = (pos.y - list_top) / row_height;
-        (row >= 0.0 && row <= entry.visible.len() as f32)
-            .then(|| (row.round() as usize).min(entry.visible.len()))
+        (row >= 0.0 && row <= rows as f32).then(|| (row.round() as usize).min(rows))
     });
+
+    if let Some((target_page, target_row)) = &app.scroll_to_row
+        && *target_page == table.page
+    {
+        let target_y = list_top + *target_row as f32 * row_height;
+        let target_rect = egui::Rect::from_min_size(
+            egui::pos2(ui.min_rect().left(), target_y),
+            egui::vec2(ui.available_width(), row_height),
+        );
+        ui.scroll_to_rect(target_rect, Some(egui::Align::Center));
+        app.scroll_to_row = None;
+    }
+
     // Selection uses display indices. Clear it when sorting, filtering, or row
     // count changes.
-    let view = format!("{sort:?}|{needle}|{}", entry.visible.len());
+    let view = format!("{sort:?}|{needle}|{rows}");
     app.keep_picked_rows_for(&table.page, &view);
     let picked: std::collections::BTreeSet<usize> =
         app.picked_rows(&table.page).cloned().unwrap_or_default();
     // Keep names with URIs for immediate optimistic queue rows.
-    let picked_songs: Vec<(String, String)> = picked
-        .iter()
-        .filter_map(|row| entry.visible.get(*row))
-        .filter_map(|index| table.items.get(*index))
-        .map(|(item, _, _)| (item.uri().to_string(), item.name().to_string()))
-        .collect();
-    let rows = entry.visible.len();
+    let picked_songs: Vec<(String, String)> = if let Some((sparse, ..)) = table.sparse {
+        picked
+            .iter()
+            .filter_map(|row| sparse.get(*row))
+            .filter_map(|item| item.playable())
+            .map(|item| (item.uri().to_string(), item.name().to_string()))
+            .collect()
+    } else {
+        picked
+            .iter()
+            .filter_map(|row| entry.visible.get(*row))
+            .filter_map(|index| table.items.get(*index))
+            .map(|(item, _, _)| (item.uri().to_string(), item.name().to_string()))
+            .collect()
+    };
+
     let mut pick = None;
-    widgets::virtual_rows(ui, entry.visible.len(), row_height, |ui, row| {
-        let index = entry.visible[row];
-        let (item, added_at, added_by) = &table.items[index];
+    let mut missing_page: Option<usize> = None;
+    widgets::virtual_rows(ui, rows, row_height, |ui, row| {
         // Shift neighboring rows around the current drop slot.
         let shift = ui.ctx().animate_value_with_time(
             ui.id().with(("table-move-shift", row)),
@@ -455,29 +511,78 @@ pub fn table(app: &mut App, ui: &mut egui::Ui, table: Table<'_>) {
             },
             0.12,
         );
-        if let Some(asked) = widgets::track_row(
-            ui,
-            app,
-            TrackRow {
-                index: if sorted { row } else { index },
-                number: Some(if sorted { row + 1 } else { index + 1 }),
-                item,
-                context: &context,
-                show_cover,
-                show_album: table.show_album,
-                added_at: added_at.as_deref(),
-                added_by: added_by.as_deref(),
-                show_added_by: table.show_added_by,
-                compact: false,
-                thin,
-                shift,
-                picked: picked.contains(&row),
-                picked_songs: &picked_songs,
-            },
-        ) {
-            pick = Some((row, asked));
+        if let Some((sparse, owner_id, owner_name)) = table.sparse {
+            if let Some(item) = sparse.get(row) {
+                if let Some((playable, added_at, adder)) =
+                    format_table_item(item, owner_id, owner_name, &app.user_names)
+                    && let Some(asked) = widgets::track_row(
+                        ui,
+                        app,
+                        TrackRow {
+                            index: row,
+                            number: Some(row + 1),
+                            item: &playable,
+                            context: &context,
+                            show_cover,
+                            show_album: table.show_album,
+                            added_at: added_at.as_deref(),
+                            added_by: adder.as_deref(),
+                            show_added_by: table.show_added_by,
+                            compact: false,
+                            thin,
+                            shift,
+                            picked: picked.contains(&row),
+                            picked_songs: &picked_songs,
+                        },
+                    )
+                {
+                    pick = Some((row, asked));
+                }
+            } else {
+                widgets::skeleton_track_row(ui, &palette, row_height, row, show_cover);
+                let page_idx = row / crate::model::PLAYLIST_PAGE_SIZE;
+                if sparse.is_missing(page_idx)
+                    && !sparse.is_in_flight(page_idx)
+                    && missing_page.is_none()
+                {
+                    missing_page = Some(page_idx);
+                }
+            }
+        } else {
+            let index = entry.visible[row];
+            let (item, added_at, added_by) = &table.items[index];
+            if let Some(asked) = widgets::track_row(
+                ui,
+                app,
+                TrackRow {
+                    index: if sorted { row } else { index },
+                    number: Some(if sorted { row + 1 } else { index + 1 }),
+                    item,
+                    context: &context,
+                    show_cover,
+                    show_album: table.show_album,
+                    added_at: added_at.as_deref(),
+                    added_by: added_by.as_deref(),
+                    show_added_by: table.show_added_by,
+                    compact: false,
+                    thin,
+                    shift,
+                    picked: picked.contains(&row),
+                    picked_songs: &picked_songs,
+                },
+            ) {
+                pick = Some((row, asked));
+            }
         }
     });
+    if let Some(page_idx) = missing_page
+        && let Page::Playlist(id) = &table.page
+    {
+        app.actions.push(Action::LoadPlaylistChunk {
+            id: id.clone(),
+            page_idx,
+        });
+    }
     if let Some((row, asked)) = pick {
         app.pick_row(&table.page, &view, row, asked, rows);
     }
@@ -519,7 +624,17 @@ pub fn table(app: &mut App, ui: &mut egui::Ui, table: Table<'_>) {
         ui.add_space(8.0);
         widgets::error_row(ui, app, error, Some(table.page.clone()));
     }
-    if table.items.is_empty() && !table.loading && table.error.is_none() {
+    if table.sparse.is_some() {
+        if rows == 0 && !table.loading && table.error.is_none() {
+            widgets::empty_state(
+                ui,
+                &palette,
+                Icon::Music,
+                "Nothing here yet",
+                "Added songs appear here.",
+            );
+        }
+    } else if table.items.is_empty() && !table.loading && table.error.is_none() {
         widgets::empty_state(
             ui,
             &palette,
@@ -619,32 +734,38 @@ fn total_duration(items: &[TableItem]) -> u64 {
         .sum()
 }
 
+pub fn format_table_item(
+    item: &crate::api::models::PlaylistItem,
+    owner_id: Option<&str>,
+    owner_name: &str,
+    names: &std::collections::HashMap<String, Option<String>>,
+) -> Option<TableItem> {
+    let playable = item.playable().cloned()?;
+    let adder = item
+        .added_by
+        .as_ref()
+        .and_then(|user| user.id.as_deref())
+        .map(|id| {
+            if Some(id) == owner_id {
+                owner_name.to_string()
+            } else {
+                names
+                    .get(id)
+                    .and_then(|name| name.clone())
+                    .unwrap_or_else(|| id.to_string())
+            }
+        });
+    Some((playable, item.added_at.clone(), adder))
+}
+
 fn items_of(
-    list: &PagedList<crate::api::models::PlaylistItem>,
+    list: &crate::model::SparseList<crate::api::models::PlaylistItem>,
     owner_id: Option<&str>,
     owner_name: &str,
     names: &std::collections::HashMap<String, Option<String>>,
 ) -> Vec<TableItem> {
-    list.items
-        .iter()
-        .filter_map(|item| {
-            let playable = item.playable().cloned()?;
-            let adder = item
-                .added_by
-                .as_ref()
-                .and_then(|user| user.id.as_deref())
-                .map(|id| {
-                    if Some(id) == owner_id {
-                        owner_name.to_string()
-                    } else {
-                        names
-                            .get(id)
-                            .and_then(|name| name.clone())
-                            .unwrap_or_else(|| id.to_string())
-                    }
-                });
-            Some((playable, item.added_at.clone(), adder))
-        })
+    list.iter()
+        .filter_map(|item| format_table_item(item, owner_id, owner_name, names))
         .collect()
 }
 
@@ -685,6 +806,7 @@ pub fn top_songs(app: &mut App, ui: &mut egui::Ui) {
         ui,
         Table {
             items: &items,
+            sparse: None,
             context: RowContext::Uris(uris),
             show_album: true,
             show_cover: true,
@@ -709,13 +831,23 @@ pub fn playlist(app: &mut App, ui: &mut egui::Ui, id: &str) {
     let user_id = app.user_id().unwrap_or("").to_string();
     match &page.playlist {
         Loadable::Loaded(playlist) => {
-            let items = items_of(
-                &page.items,
-                playlist.owner.id.as_deref(),
-                playlist.owner_name(),
-                &app.user_names,
-            );
-            let count = playlist.track_total().max(items.len() as u32);
+            let needle = page.filter.trim().to_lowercase();
+            let sort = app
+                .table_sorts
+                .get(&Page::Playlist(id.to_string()))
+                .copied();
+            let is_sparse = sort.is_none() && needle.is_empty();
+            let items = if is_sparse {
+                Vec::new()
+            } else {
+                items_of(
+                    &page.items,
+                    playlist.owner.id.as_deref(),
+                    playlist.owner_name(),
+                    &app.user_names,
+                )
+            };
+            let count = playlist.track_total().max(page.items.loaded_count as u32);
             // Spotify's collaborative flag covers secret collaborations; a
             // playlist made together today is recognised by who added songs.
             let owner_id = playlist.owner.id.as_deref();
@@ -751,10 +883,19 @@ pub fn playlist(app: &mut App, ui: &mut egui::Ui, id: &str) {
                 ));
             }
             let count_text = if page.items.is_complete() {
+                let total_ms: u64 = if is_sparse {
+                    page.items
+                        .iter()
+                        .filter_map(|i| i.playable())
+                        .map(|p| p.duration_ms() as u64)
+                        .sum()
+                } else {
+                    total_duration(&items)
+                };
                 format!(
                     "{} songs, {}",
                     util::format_count(count as u64),
-                    util::format_total_ms(total_duration(&items))
+                    util::format_total_ms(total_ms)
                 )
             } else {
                 format!("{} songs", util::format_count(count as u64))
@@ -781,21 +922,20 @@ pub fn playlist(app: &mut App, ui: &mut egui::Ui, id: &str) {
             );
             let owned = playlist.owned_by(&user_id);
             let saved = app.is_saved(&playlist.uri).unwrap_or(false);
-            let needle = page.filter.trim().to_lowercase();
-            let sort = app
-                .table_sorts
-                .get(&Page::Playlist(id.to_string()))
-                .copied();
-            let table_view = prepare_table_view(
-                ui,
-                app,
-                &Page::Playlist(id.to_string()),
-                &items,
-                &needle,
-                sort,
-                page.items.revision,
-            );
-            let view_play = table_view.view_uris.as_ref().map(|uris| uris.to_vec());
+            let view_play = if is_sparse {
+                None
+            } else {
+                let table_view = prepare_table_view(
+                    ui,
+                    app,
+                    &Page::Playlist(id.to_string()),
+                    &items,
+                    &needle,
+                    sort,
+                    page.items.revision,
+                );
+                table_view.view_uris.as_ref().map(|uris| uris.to_vec())
+            };
             let playlist_clone = playlist.clone();
             actions_row(
                 app,
@@ -818,6 +958,15 @@ pub fn playlist(app: &mut App, ui: &mut egui::Ui, id: &str) {
                 ui,
                 Table {
                     items: &items,
+                    sparse: if is_sparse {
+                        Some((
+                            &page.items,
+                            playlist.owner.id.as_deref(),
+                            playlist.owner_name(),
+                        ))
+                    } else {
+                        None
+                    },
                     context: RowContext::Context {
                         uri: playlist.uri.clone(),
                         editable_playlist: editable,
@@ -906,6 +1055,7 @@ pub fn album(app: &mut App, ui: &mut egui::Ui, id: &str) {
                 ui,
                 Table {
                     items: &items,
+                    sparse: None,
                     context: RowContext::Context {
                         uri: album.uri.clone(),
                         editable_playlist: None,
@@ -1113,6 +1263,7 @@ pub fn liked(app: &mut App, ui: &mut egui::Ui) {
         ui,
         Table {
             items: &items,
+            sparse: None,
             context,
             show_album: true,
             show_cover: true,

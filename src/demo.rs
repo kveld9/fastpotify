@@ -745,7 +745,7 @@ pub fn apply_flags(app: &mut App, page: Option<&str>, show: Option<&str>) {
                     }];
                 };
                 if let Some(page) = app.playlist_pages.get_mut("pl1") {
-                    for (entry, names) in page.items.items.iter_mut().zip(titles) {
+                    for (entry, names) in page.items.iter_mut().zip(titles) {
                         if let Some(PlayableItem::Track(track)) = &mut entry.item {
                             rename(track, names);
                         }
@@ -1446,7 +1446,6 @@ mod tests {
         }
         let order = |app: &App| -> Vec<String> {
             app.playlist_pages["pl1"]
-                .items
                 .items
                 .iter()
                 .filter_map(|item| item.playable().map(|playable| playable.uri().to_string()))

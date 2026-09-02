@@ -48,6 +48,16 @@ adds a separate Development Mode quota. See
   api.github.com once a day for updates. You can turn off update checks in
   Settings.
 
+## Playlist paging and Jump-to-Playing
+
+Large playlists are loaded sparsely in 100-track pages as the viewport requires,
+avoiding unbounded memory allocation. When jumping to the currently playing song
+within a playlist, Fastpotify checks its local playback context or cached pages
+instantly without network requests. If playback was initiated outside Fastpotify
+(such as from Spotify Connect on another device) and the track sits in an unloaded
+page, Fastpotify progressively queries missing pages with at most two concurrent
+requests until the track is located or the playlist is exhausted.
+
 ## When Spotify pushes back
 
 Each Web API session has separate concurrency and rate limits. A `Retry-After`

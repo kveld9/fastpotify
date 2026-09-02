@@ -251,6 +251,326 @@ impl<T> PagedList<T> {
     }
 }
 
+pub const PLAYLIST_PAGE_SIZE: usize = crate::backend::PLAYLIST_PAGE_SIZE as usize;
+
+/// A sparse, chunked list that holds pages by offset for virtualized scrolling.
+#[derive(Clone, Debug)]
+pub struct SparseList<T> {
+    pub pages: Vec<Option<Vec<T>>>,
+    pub total: Option<u32>,
+    pub in_flight: std::collections::BTreeSet<usize>,
+    pub loaded_count: usize,
+    pub loaded_once: bool,
+    pub loading: bool,
+    pub error: Option<String>,
+    pub revision: u64,
+}
+
+impl<T> Default for SparseList<T> {
+    fn default() -> Self {
+        Self {
+            pages: Vec::new(),
+            total: None,
+            in_flight: std::collections::BTreeSet::new(),
+            loaded_count: 0,
+            loaded_once: false,
+            loading: false,
+            error: None,
+            revision: 0,
+        }
+    }
+}
+
+impl<T> SparseList<T> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn from_items(items: Vec<T>) -> Self {
+        let mut list = Self::default();
+        list.set_cached(items);
+        list
+    }
+
+    pub fn set_total(&mut self, total: u32) {
+        self.total = Some(total);
+        let num_pages = (total as usize).div_ceil(PLAYLIST_PAGE_SIZE);
+        if num_pages < self.pages.len() {
+            for items in self.pages.drain(num_pages..).flatten() {
+                self.loaded_count = self.loaded_count.saturating_sub(items.len());
+            }
+            self.in_flight.retain(|&idx| idx < num_pages);
+        } else if num_pages > self.pages.len() {
+            self.pages.resize_with(num_pages, || None);
+        }
+    }
+
+    pub fn get(&self, index: usize) -> Option<&T> {
+        if self.total.is_some_and(|tot| index >= tot as usize) {
+            return None;
+        }
+        let page_idx = index / PLAYLIST_PAGE_SIZE;
+        let rem = index % PLAYLIST_PAGE_SIZE;
+        self.pages.get(page_idx)?.as_ref()?.get(rem)
+    }
+
+    pub fn insert_page(&mut self, offset: usize, items: Vec<T>) {
+        let page_idx = offset / PLAYLIST_PAGE_SIZE;
+        let num_pages = page_idx + 1;
+        if self.pages.len() < num_pages {
+            self.pages.resize_with(num_pages, || None);
+        }
+        if let Some(existing) = &self.pages[page_idx] {
+            self.loaded_count = self.loaded_count.saturating_sub(existing.len());
+        }
+        self.loaded_count += items.len();
+        self.pages[page_idx] = Some(items);
+        self.in_flight.remove(&page_idx);
+        self.loading = !self.in_flight.is_empty();
+        self.loaded_once = true;
+        self.error = None;
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    pub fn absorb(&mut self, offset: u32, page: Page_<T>) {
+        self.set_total(page.total);
+        self.insert_page(offset as usize, page.items);
+    }
+
+    pub fn mark_in_flight(&mut self, page_idx: usize) {
+        self.in_flight.insert(page_idx);
+        self.loading = true;
+    }
+
+    pub fn fail_page(&mut self, page_idx: usize, error: String) {
+        self.in_flight.remove(&page_idx);
+        self.loading = !self.in_flight.is_empty();
+        self.error = Some(error);
+        self.loaded_once = true;
+    }
+
+    pub fn fail(&mut self, error: String) {
+        self.in_flight.clear();
+        self.loading = false;
+        self.error = Some(error);
+        self.loaded_once = true;
+    }
+
+    pub fn is_missing(&self, page_idx: usize) -> bool {
+        self.pages.get(page_idx).is_none_or(|p| p.is_none())
+    }
+
+    pub fn is_in_flight(&self, page_idx: usize) -> bool {
+        self.in_flight.contains(&page_idx)
+    }
+
+    pub fn can_request_more(&self) -> bool {
+        self.in_flight.len() < 2
+    }
+
+    pub fn can_load_more(&self) -> bool {
+        !self.is_complete() && self.can_request_more()
+    }
+
+    pub fn is_complete(&self) -> bool {
+        let Some(total) = self.total else {
+            return false;
+        };
+        if total == 0 {
+            return self.loaded_once;
+        }
+        if self.loaded_count < total as usize {
+            return false;
+        }
+        let num_pages = (total as usize).div_ceil(PLAYLIST_PAGE_SIZE);
+        (0..num_pages).all(|idx| self.pages.get(idx).is_some_and(|p| p.is_some()))
+    }
+
+    pub fn next_missing_offset(&self) -> Option<u32> {
+        let total = self.total?;
+        let num_pages = (total as usize).div_ceil(PLAYLIST_PAGE_SIZE);
+        for idx in 0..num_pages {
+            if self.pages.get(idx).is_none_or(|p| p.is_none()) && !self.in_flight.contains(&idx) {
+                return Some((idx * PLAYLIST_PAGE_SIZE) as u32);
+            }
+        }
+        None
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self {
+            revision: self.revision.wrapping_add(1),
+            ..Default::default()
+        };
+    }
+
+    pub fn set_cached(&mut self, items: Vec<T>) {
+        let total = items.len();
+        self.total = Some(total as u32);
+        let num_pages = if total == 0 {
+            0
+        } else {
+            total.div_ceil(PLAYLIST_PAGE_SIZE)
+        };
+        let mut pages = Vec::with_capacity(num_pages);
+        let mut iter = items.into_iter();
+        for _ in 0..num_pages {
+            let chunk: Vec<T> = iter.by_ref().take(PLAYLIST_PAGE_SIZE).collect();
+            pages.push(Some(chunk));
+        }
+        self.pages = pages;
+        self.loaded_count = total;
+        self.in_flight.clear();
+        self.loading = false;
+        self.loaded_once = true;
+        self.error = None;
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        self.pages.iter().filter_map(|p| p.as_ref()).flatten()
+    }
+
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
+        self.pages.iter_mut().filter_map(|p| p.as_mut()).flatten()
+    }
+
+    pub fn to_vec(&self) -> Vec<T>
+    where
+        T: Clone,
+    {
+        self.iter().cloned().collect()
+    }
+
+    pub fn retain<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&T) -> bool,
+        T: Clone,
+    {
+        if self.is_complete() {
+            let mut all = self.to_vec();
+            all.retain(|item| f(item));
+            self.set_cached(all);
+            return;
+        }
+        let mut removed = 0;
+        for page in self.pages.iter_mut().flatten() {
+            let before = page.len();
+            page.retain(|item| f(item));
+            removed += before - page.len();
+        }
+        if removed > 0 {
+            self.loaded_count = self.loaded_count.saturating_sub(removed);
+            if let Some(total) = self.total.as_mut() {
+                *total = total.saturating_sub(removed as u32);
+            }
+            self.revision = self.revision.wrapping_add(1);
+        }
+    }
+
+    pub fn reorder(&mut self, from: usize, to: usize)
+    where
+        T: Clone,
+    {
+        if self.is_complete() {
+            let mut all = self.to_vec();
+            if from < all.len() && to <= all.len() {
+                let item = all.remove(from);
+                let insert_at = if to > from { to - 1 } else { to };
+                all.insert(insert_at.min(all.len()), item);
+                self.set_cached(all);
+            }
+            return;
+        }
+        let from_page = from / PLAYLIST_PAGE_SIZE;
+        let to_page = to / PLAYLIST_PAGE_SIZE;
+        if from_page == to_page
+            && let Some(Some(page)) = self.pages.get_mut(from_page)
+        {
+            let p_from = from % PLAYLIST_PAGE_SIZE;
+            let p_to = to % PLAYLIST_PAGE_SIZE;
+            if p_from < page.len() && p_to <= page.len() {
+                let item = page.remove(p_from);
+                let insert_at = if p_to > p_from { p_to - 1 } else { p_to };
+                page.insert(insert_at.min(page.len()), item);
+                self.revision = self.revision.wrapping_add(1);
+            }
+        }
+    }
+
+    pub fn find_index<F>(&self, mut predicate: F) -> Option<usize>
+    where
+        F: FnMut(&T) -> bool,
+    {
+        for (page_idx, page) in self.pages.iter().enumerate() {
+            if let Some(items) = page {
+                for (rem, item) in items.iter().enumerate() {
+                    let global_idx = page_idx * PLAYLIST_PAGE_SIZE + rem;
+                    if self.total.is_some_and(|tot| global_idx >= tot as usize) {
+                        break;
+                    }
+                    if predicate(item) {
+                        return Some(global_idx);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub fn get_page(&self, page_idx: usize) -> Option<&[T]> {
+        self.pages.get(page_idx)?.as_deref()
+    }
+
+    pub fn loaded_page_indices(&self) -> std::collections::BTreeSet<usize> {
+        self.pages
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, page)| page.as_ref().map(|_| idx))
+            .collect()
+    }
+}
+
+/// A track row index known from local play initiation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrackedPlayRow {
+    pub playlist_id: String,
+    pub row: usize,
+    pub uri: String,
+}
+
+/// Progressive locator state machine for finding a track outside loaded pages.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum PlaylistLocator {
+    #[default]
+    Idle,
+    Locating {
+        playlist_id: String,
+        target_uri: String,
+        generation: u64,
+        locator_generation: u64,
+        in_flight: std::collections::BTreeSet<usize>,
+        checked_pages: std::collections::BTreeSet<usize>,
+    },
+}
+
+impl PlaylistLocator {
+    pub fn is_active(&self) -> bool {
+        matches!(self, Self::Locating { .. })
+    }
+
+    pub fn target(&self) -> Option<(&str, &str)> {
+        match self {
+            Self::Locating {
+                playlist_id,
+                target_uri,
+                ..
+            } => Some((playlist_id.as_str(), target_uri.as_str())),
+            Self::Idle => None,
+        }
+    }
+}
+
 type Page_<T> = crate::api::models::Page<T>;
 
 /// Selected track-table rows for batch actions.
@@ -393,7 +713,7 @@ pub struct SearchState {
 pub struct PlaylistPage {
     pub generation: u64,
     pub playlist: Loadable<Playlist>,
-    pub items: PagedList<PlaylistItem>,
+    pub items: SparseList<PlaylistItem>,
     pub filter: String,
     /// Contributor IDs from loaded pages and a sample of the final page.
     pub contributors: std::collections::BTreeSet<String>,
@@ -649,6 +969,11 @@ pub enum Action {
     SetSearchFilter(SearchFilter),
     FocusSearch,
     LoadMore(Page),
+    LoadPlaylistChunk {
+        id: String,
+        page_idx: usize,
+    },
+    JumpToPlayingTrack,
     LoadMoreRecents,
     ReloadRecents,
     SetQueueTab(QueueTab),
@@ -726,4 +1051,166 @@ pub enum Action {
     /// in the list.
     DownloadMilkdropPack(usize),
     Quit,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sparse_list_basic_and_arbitrary_page_insertion() {
+        let mut list: SparseList<String> = SparseList::new();
+        list.set_total(250);
+        assert_eq!(list.pages.len(), 3);
+        assert!(!list.is_complete());
+        assert_eq!(list.get(0), None);
+        assert_eq!(list.get(150), None);
+
+        // Insert page 1 (items 100..200)
+        let page_1_items: Vec<String> = (100..200).map(|i| format!("item_{i}")).collect();
+        list.insert_page(100, page_1_items);
+        assert_eq!(list.loaded_count, 100);
+        assert!(!list.is_complete());
+        assert_eq!(list.get(50), None);
+        assert_eq!(list.get(100), Some(&"item_100".to_string()));
+        assert_eq!(list.get(199), Some(&"item_199".to_string()));
+        assert_eq!(list.get(200), None);
+
+        // Insert page 0 (items 0..100)
+        let page_0_items: Vec<String> = (0..100).map(|i| format!("item_{i}")).collect();
+        list.insert_page(0, page_0_items);
+        assert_eq!(list.loaded_count, 200);
+        assert!(!list.is_complete());
+
+        // Insert page 2 (items 200..250)
+        let page_2_items: Vec<String> = (200..250).map(|i| format!("item_{i}")).collect();
+        list.insert_page(200, page_2_items);
+        assert_eq!(list.loaded_count, 250);
+        assert!(list.is_complete());
+        assert_eq!(list.get(249), Some(&"item_249".to_string()));
+        assert_eq!(list.get(250), None);
+    }
+
+    #[test]
+    fn sparse_list_duplicate_page_insertion_does_not_double_count() {
+        let mut list: SparseList<i32> = SparseList::new();
+        list.set_total(100);
+        list.insert_page(0, vec![1, 2, 3]);
+        assert_eq!(list.loaded_count, 3);
+
+        list.insert_page(0, vec![4, 5, 6, 7]);
+        assert_eq!(list.loaded_count, 4);
+    }
+
+    #[test]
+    fn sparse_list_in_flight_and_concurrency_limit() {
+        let mut list: SparseList<i32> = SparseList::new();
+        list.set_total(500);
+
+        assert!(list.can_request_more());
+        assert!(!list.is_in_flight(0));
+        assert!(list.is_missing(0));
+
+        list.mark_in_flight(0);
+        assert!(list.is_in_flight(0));
+        assert!(list.loading);
+        assert!(list.can_request_more());
+
+        list.mark_in_flight(1);
+        assert!(list.is_in_flight(1));
+        assert!(!list.can_request_more());
+
+        list.fail_page(0, "Network error".into());
+        assert!(!list.is_in_flight(0));
+        assert!(list.can_request_more());
+        assert!(list.loading);
+        assert_eq!(list.error.as_deref(), Some("Network error"));
+
+        list.insert_page(100, vec![42]);
+        assert!(!list.is_in_flight(1));
+        assert!(!list.loading);
+    }
+
+    #[test]
+    fn sparse_list_next_missing_offset() {
+        let mut list: SparseList<i32> = SparseList::new();
+        list.set_total(300);
+
+        assert_eq!(list.next_missing_offset(), Some(0));
+        list.mark_in_flight(0);
+        assert_eq!(list.next_missing_offset(), Some(100));
+        list.insert_page(100, (0..100).collect());
+        assert_eq!(list.next_missing_offset(), Some(200));
+    }
+
+    #[test]
+    fn sparse_list_find_index() {
+        let mut list: SparseList<String> = SparseList::new();
+        list.set_total(300);
+        list.insert_page(100, vec!["alpha".into(), "beta".into(), "gamma".into()]);
+
+        assert_eq!(list.find_index(|s| s == "beta"), Some(101));
+        assert_eq!(list.find_index(|s| s == "delta"), None);
+    }
+
+    #[test]
+    fn sparse_list_set_total_shrinking() {
+        let mut list: SparseList<i32> = SparseList::new();
+        list.set_total(300);
+        list.insert_page(0, (0..100).collect());
+        list.insert_page(200, (0..50).collect());
+        assert_eq!(list.loaded_count, 150);
+
+        list.set_total(100);
+        assert_eq!(list.pages.len(), 1);
+        assert_eq!(list.loaded_count, 100);
+    }
+
+    #[test]
+    fn sparse_list_retain_preserves_unloaded_pages() {
+        let mut list: SparseList<String> = SparseList::new();
+        list.set_total(500);
+        list.insert_page(0, vec!["keep".into(), "drop".into(), "keep2".into()]);
+        list.insert_page(400, vec!["p4_keep".into(), "drop".into()]);
+
+        assert_eq!(list.pages.len(), 5);
+        assert!(list.is_missing(1));
+        assert!(list.is_missing(2));
+        assert!(list.is_missing(3));
+
+        // Retain on sparse list must NOT collapse or erase missing pages!
+        list.retain(|s| s != "drop");
+
+        assert_eq!(list.pages.len(), 5);
+        assert!(list.is_missing(1));
+        assert!(list.is_missing(2));
+        assert!(list.is_missing(3));
+        assert_eq!(list.get(0), Some(&"keep".to_string()));
+        assert_eq!(list.get(1), Some(&"keep2".to_string()));
+        assert_eq!(list.get(400), Some(&"p4_keep".to_string()));
+        assert_eq!(list.total, Some(498));
+    }
+
+    #[test]
+    fn sparse_list_reorder_within_page_preserves_unloaded_pages() {
+        let mut list: SparseList<String> = SparseList::new();
+        list.set_total(500);
+        list.insert_page(0, vec!["a".into(), "b".into(), "c".into()]);
+        list.insert_page(300, vec!["p3".into()]);
+
+        assert_eq!(list.pages.len(), 5);
+        assert!(list.is_missing(1));
+        assert!(list.is_missing(2));
+
+        // Reorder within page 0: move 'a' (row 0) to insert_before 3
+        list.reorder(0, 3);
+
+        assert_eq!(list.pages.len(), 5);
+        assert!(list.is_missing(1));
+        assert!(list.is_missing(2));
+        assert_eq!(list.get(0), Some(&"b".to_string()));
+        assert_eq!(list.get(1), Some(&"c".to_string()));
+        assert_eq!(list.get(2), Some(&"a".to_string()));
+        assert_eq!(list.get(300), Some(&"p3".to_string()));
+    }
 }

@@ -257,6 +257,10 @@ pub struct App {
     pub show_devices: bool,
     pub toasts: Vec<Toast>,
     pub actions: Vec<Action>,
+    pub scroll_to_row: Option<(Page, usize)>,
+    pub tracked_play: Option<crate::model::TrackedPlayRow>,
+    pub playlist_locator: crate::model::PlaylistLocator,
+    pub next_locator_generation: u64,
     volume_before_mute: Option<u8>,
     /// Context and track URIs whose pending play buttons show a spinner.
     pending_play_keys: Vec<String>,
@@ -531,6 +535,10 @@ impl App {
             show_devices: false,
             toasts: Vec::new(),
             actions: Vec::new(),
+            scroll_to_row: None,
+            tracked_play: None,
+            playlist_locator: crate::model::PlaylistLocator::Idle,
+            next_locator_generation: 0,
             volume_before_mute: None,
             pending_play_keys: Vec::new(),
             pending_play_at: None,
@@ -1375,13 +1383,10 @@ impl App {
         }
         let found = if let Some(pid) = context_uri.strip_prefix("spotify:playlist:") {
             self.playlist_pages.get(pid).and_then(|page| {
-                page.items
-                    .items
-                    .iter()
-                    .find_map(|item| match item.playable() {
-                        Some(PlayableItem::Track(track)) if track.uri == uri => Some(track.clone()),
-                        _ => None,
-                    })
+                page.items.iter().find_map(|item| match item.playable() {
+                    Some(PlayableItem::Track(track)) if track.uri == uri => Some(track.clone()),
+                    _ => None,
+                })
             })
         } else if let Some(aid) = context_uri.strip_prefix("spotify:album:") {
             self.album_pages.get(aid).and_then(|page| {
@@ -1457,6 +1462,7 @@ impl App {
         self.resume_context = self.playing_context_uri();
         self.resume_track = Some(now.uri.clone());
         self.resume_position_ms = 0;
+        self.check_playback_tracking();
         if now.local
             && !now.is_episode
             && let Some(id) = &now.id
@@ -2130,7 +2136,7 @@ impl App {
                     });
                 }
                 if !page.items.loaded_once && page.items.can_load_more() {
-                    page.items.loading = true;
+                    page.items.mark_in_flight(0);
                     self.backend.api(ApiRequest::PlaylistItems {
                         id: id.clone(),
                         offset: 0,
@@ -2339,16 +2345,17 @@ impl App {
                 }
             }
             Page::Playlist(id) => {
-                if let Some(page) = self.playlist_pages.get_mut(&id) {
-                    let list = &mut page.items;
-                    if let Some(offset) = list.next_offset.filter(|_| list.can_load_more()) {
-                        list.loading = true;
-                        self.backend.api(ApiRequest::PlaylistItems {
-                            id,
-                            offset,
-                            generation: page.generation,
-                        });
-                    }
+                if let Some(page) = self.playlist_pages.get_mut(&id)
+                    && page.items.can_load_more()
+                    && let Some(offset) = page.items.next_missing_offset()
+                {
+                    let page_idx = (offset as usize) / crate::model::PLAYLIST_PAGE_SIZE;
+                    page.items.mark_in_flight(page_idx);
+                    self.backend.api(ApiRequest::PlaylistItems {
+                        id,
+                        offset,
+                        generation: page.generation,
+                    });
                 }
             }
             Page::Album(id) => {
@@ -2378,6 +2385,84 @@ impl App {
         }
     }
 
+    pub fn check_playback_tracking(&mut self) {
+        let current_uri = self.now_playing().map(|n| n.uri);
+        if let Some(tracked) = &self.tracked_play
+            && Some(&tracked.uri) != current_uri.as_ref()
+        {
+            self.tracked_play = None;
+        }
+        if let crate::model::PlaylistLocator::Locating { target_uri, .. } = &self.playlist_locator
+            && Some(target_uri) != current_uri.as_ref()
+        {
+            self.playlist_locator = crate::model::PlaylistLocator::Idle;
+        }
+    }
+
+    pub fn pump_playlist_locator(&mut self, id: &str) {
+        let Page::Playlist(current_id) = self.page().clone() else {
+            self.playlist_locator = crate::model::PlaylistLocator::Idle;
+            return;
+        };
+        if current_id != id {
+            self.playlist_locator = crate::model::PlaylistLocator::Idle;
+            return;
+        }
+        let Some(page) = self.playlist_pages.get_mut(id) else {
+            self.playlist_locator = crate::model::PlaylistLocator::Idle;
+            return;
+        };
+        let crate::model::PlaylistLocator::Locating {
+            playlist_id,
+            generation,
+            in_flight,
+            checked_pages,
+            ..
+        } = &mut self.playlist_locator
+        else {
+            return;
+        };
+        if playlist_id != id || *generation != page.generation {
+            self.playlist_locator = crate::model::PlaylistLocator::Idle;
+            return;
+        }
+
+        let Some(total) = page.items.total else {
+            return;
+        };
+        let num_pages = (total as usize).div_ceil(crate::model::PLAYLIST_PAGE_SIZE);
+
+        while in_flight.len() < 2 {
+            let next_page = (0..num_pages).find(|&p| {
+                !checked_pages.contains(&p)
+                    && !in_flight.contains(&p)
+                    && !page.items.is_in_flight(p)
+                    && page.items.is_missing(p)
+            });
+            if let Some(p) = next_page {
+                in_flight.insert(p);
+                page.items.mark_in_flight(p);
+                let offset = (p * crate::model::PLAYLIST_PAGE_SIZE) as u32;
+                self.backend.api(ApiRequest::PlaylistItems {
+                    id: id.to_string(),
+                    offset,
+                    generation: page.generation,
+                });
+            } else {
+                break;
+            }
+        }
+
+        if in_flight.is_empty() {
+            let all_checked =
+                (0..num_pages).all(|p| checked_pages.contains(&p) || !page.items.is_missing(p));
+            if all_checked {
+                self.playlist_locator = crate::model::PlaylistLocator::Idle;
+                self.toast("Playing track is not in this playlist");
+            }
+        }
+    }
+
     fn reload(&mut self, page: Page) {
         match &page {
             Page::Home => self.load_home(true),
@@ -2389,9 +2474,24 @@ impl App {
             Page::Episodes => self.library.episodes.reset(),
             Page::Playlist(id) => {
                 if let Some(playlist) = self.playlist_pages.get_mut(id) {
+                    if self
+                        .tracked_play
+                        .as_ref()
+                        .is_some_and(|t| t.playlist_id == *id)
+                    {
+                        self.tracked_play = None;
+                    }
+                    if self
+                        .playlist_locator
+                        .target()
+                        .is_some_and(|(pid, _)| pid == id)
+                    {
+                        self.playlist_locator = crate::model::PlaylistLocator::Idle;
+                    }
                     self.load_generation += 1;
                     playlist.generation = self.load_generation;
-                    playlist.items.loading = true;
+                    playlist.items.reset();
+                    playlist.items.mark_in_flight(0);
                     playlist.cache_complete = false;
                     playlist.pending_cache = None;
                     self.backend.api(ApiRequest::Playlist {
@@ -3174,7 +3274,7 @@ impl App {
                             // added often sit at the end; look there once.
                             if !page.tail_checked {
                                 page.tail_checked = true;
-                                let loaded = page.items.items.len() as u32;
+                                let loaded = page.items.loaded_count as u32;
                                 if let Some(total) =
                                     page.items.total.filter(|total| *total > loaded)
                                 {
@@ -3186,11 +3286,56 @@ impl App {
                                 }
                             }
                         }
-                        Err(error) => page.items.fail(friendly_page_error(&error)),
+                        Err(error) => {
+                            let page_idx = (offset as usize) / crate::model::PLAYLIST_PAGE_SIZE;
+                            page.items.fail_page(page_idx, friendly_page_error(&error));
+                        }
                     }
                 }
                 self.request_contains(uris);
                 self.request_user_names(adders);
+
+                let page_idx = (offset as usize) / crate::model::PLAYLIST_PAGE_SIZE;
+                if let crate::model::PlaylistLocator::Locating {
+                    playlist_id,
+                    generation: loc_gen,
+                    in_flight,
+                    checked_pages,
+                    ..
+                } = &mut self.playlist_locator
+                    && playlist_id == &id
+                    && *loc_gen == generation
+                {
+                    in_flight.remove(&page_idx);
+                    checked_pages.insert(page_idx);
+                }
+
+                // Check if target was found in page.items
+                let mut found_locator_row = None;
+                if let crate::model::PlaylistLocator::Locating {
+                    playlist_id,
+                    target_uri,
+                    generation: loc_gen,
+                    ..
+                } = &self.playlist_locator
+                    && playlist_id == &id
+                    && *loc_gen == generation
+                    && let Some(page) = self.playlist_pages.get(&id)
+                    && let Some(items) = page.items.get_page(page_idx)
+                    && let Some(pos) = items
+                        .iter()
+                        .position(|item| item.playable().is_some_and(|p| p.uri() == target_uri))
+                {
+                    found_locator_row = Some(offset as usize + pos);
+                }
+
+                if let Some(row) = found_locator_row {
+                    self.scroll_to_row = Some((Page::Playlist(id.clone()), row));
+                    self.playlist_locator = crate::model::PlaylistLocator::Idle;
+                } else if self.playlist_locator.is_active() {
+                    self.pump_playlist_locator(&id);
+                }
+
                 // The whole list is here; remember it under its snapshot.
                 if let Some(page) = self.playlist_pages.get(&id)
                     && page.items.is_complete()
@@ -3203,7 +3348,7 @@ impl App {
                     self.backend.send(Command::StorePlaylistCache {
                         id: id.clone(),
                         snapshot,
-                        items: page.items.items.clone(),
+                        items: page.items.to_vec(),
                     });
                 }
                 // A sorted table means the whole list, not the loaded part.
@@ -3675,6 +3820,11 @@ impl App {
     // ---- navigation ------------------------------------------------------------
 
     pub fn open(&mut self, page: Page) {
+        if let Some((pid, _)) = self.playlist_locator.target()
+            && page != Page::Playlist(pid.to_string())
+        {
+            self.playlist_locator = crate::model::PlaylistLocator::Idle;
+        }
         if *self.page() == page {
             self.ensure_loaded(page);
             return;
@@ -3794,7 +3944,6 @@ impl App {
         let uris: Vec<String> = if let Some(id) = context_uri.strip_prefix("spotify:playlist:") {
             self.playlist_pages
                 .get(id)?
-                .items
                 .items
                 .iter()
                 .filter_map(|item| item.playable())
@@ -4521,16 +4670,34 @@ impl App {
                 RowContext::Context {
                     uri: context_uri, ..
                 } => {
+                    if let Some(id) = context_uri.strip_prefix("spotify:playlist:") {
+                        self.tracked_play = Some(crate::model::TrackedPlayRow {
+                            playlist_id: id.to_string(),
+                            row: index as usize,
+                            uri: uri.clone(),
+                        });
+                    } else {
+                        self.tracked_play = None;
+                    }
+                    self.playlist_locator = crate::model::PlaylistLocator::Idle;
                     let request = PlayRequest::context(context_uri).starting_at_uri(uri);
                     self.play_request(request, false);
                 }
                 RowContext::Uris(uris) => {
+                    self.tracked_play = None;
+                    self.playlist_locator = crate::model::PlaylistLocator::Idle;
                     let (uris, index) = cap_uris(uris, index);
                     let request = PlayRequest::tracks(uris).starting_at_index(index);
                     self.play_request(request, false);
                 }
-                RowContext::Queue => self.play_queue_item(index as usize, uri),
+                RowContext::Queue => {
+                    self.tracked_play = None;
+                    self.playlist_locator = crate::model::PlaylistLocator::Idle;
+                    self.play_queue_item(index as usize, uri);
+                }
                 RowContext::View { uris, context_uri } => {
+                    self.tracked_play = None;
+                    self.playlist_locator = crate::model::PlaylistLocator::Idle;
                     let (uris, index) = cap_uris(uris, index);
                     let request = PlayRequest::tracks(uris).starting_at_index(index);
                     self.play_request(request, false);
@@ -4662,6 +4829,20 @@ impl App {
                 });
             }
             Action::RemoveFromPlaylist { playlist_id, uris } => {
+                if self
+                    .tracked_play
+                    .as_ref()
+                    .is_some_and(|t| t.playlist_id == playlist_id)
+                {
+                    self.tracked_play = None;
+                }
+                if self
+                    .playlist_locator
+                    .target()
+                    .is_some_and(|(pid, _)| pid == playlist_id)
+                {
+                    self.playlist_locator = crate::model::PlaylistLocator::Idle;
+                }
                 let snapshot_id = self
                     .playlist_pages
                     .get(&playlist_id)
@@ -4685,6 +4866,20 @@ impl App {
                 from,
                 to,
             } => {
+                if self
+                    .tracked_play
+                    .as_ref()
+                    .is_some_and(|t| t.playlist_id == playlist_id)
+                {
+                    self.tracked_play = None;
+                }
+                if self
+                    .playlist_locator
+                    .target()
+                    .is_some_and(|(pid, _)| pid == playlist_id)
+                {
+                    self.playlist_locator = crate::model::PlaylistLocator::Idle;
+                }
                 let snapshot_id = self
                     .playlist_pages
                     .get(&playlist_id)
@@ -4784,6 +4979,90 @@ impl App {
                 }
             }
             Action::LoadMore(page) => self.load_more(page),
+            Action::LoadPlaylistChunk { id, page_idx } => {
+                if let Some(page) = self.playlist_pages.get_mut(&id)
+                    && page.items.can_request_more()
+                    && !page.items.is_in_flight(page_idx)
+                    && page.items.is_missing(page_idx)
+                {
+                    page.items.mark_in_flight(page_idx);
+                    let offset = (page_idx * crate::model::PLAYLIST_PAGE_SIZE) as u32;
+                    self.backend.api(ApiRequest::PlaylistItems {
+                        id,
+                        offset,
+                        generation: page.generation,
+                    });
+                }
+            }
+            Action::JumpToPlayingTrack => {
+                let Some(uri) = self.now_playing().as_ref().map(|n| n.uri.clone()) else {
+                    self.toast("Nothing is playing");
+                    return;
+                };
+                let Page::Playlist(id) = self.page().clone() else {
+                    return;
+                };
+                let Some(page) = self.playlist_pages.get(&id) else {
+                    return;
+                };
+
+                // 1. Check tracked play row (O(1), 0 requests)
+                if let Some(tracked) = &self.tracked_play
+                    && tracked.playlist_id == id
+                    && tracked.uri == uri
+                {
+                    let row_valid = page
+                        .items
+                        .get(tracked.row)
+                        .is_none_or(|item| item.playable().is_some_and(|p| p.uri() == uri));
+                    if row_valid {
+                        self.scroll_to_row = Some((Page::Playlist(id), tracked.row));
+                        return;
+                    }
+                    self.tracked_play = None;
+                }
+
+                // 2. Check loaded pages in SparseList
+                if let Some(idx) = page
+                    .items
+                    .find_index(|item| item.playable().is_some_and(|p| p.uri() == uri))
+                {
+                    self.scroll_to_row = Some((Page::Playlist(id), idx));
+                    return;
+                }
+
+                // 3. If playlist is complete, track is not in it
+                if page.items.is_complete() {
+                    self.toast("Playing track is not in this playlist");
+                    return;
+                }
+
+                // 4. If already locating this exact track, do not disrupt progress
+                if let crate::model::PlaylistLocator::Locating {
+                    playlist_id,
+                    target_uri,
+                    ..
+                } = &self.playlist_locator
+                    && playlist_id == &id
+                    && target_uri == &uri
+                {
+                    return;
+                }
+
+                // 5. Start progressive locator
+                let locator_generation = self.next_locator_generation;
+                self.next_locator_generation = self.next_locator_generation.wrapping_add(1);
+                self.playlist_locator = crate::model::PlaylistLocator::Locating {
+                    playlist_id: id.clone(),
+                    target_uri: uri,
+                    generation: page.generation,
+                    locator_generation,
+                    in_flight: std::collections::BTreeSet::new(),
+                    checked_pages: page.items.loaded_page_indices(),
+                };
+                self.toast("Locating track in playlist...");
+                self.pump_playlist_locator(&id);
+            }
             Action::LoadMoreRecents => self.load_more_recents(),
             Action::ReloadRecents => self.reload_recents(),
             Action::SetQueueTab(tab) => {
@@ -5841,7 +6120,7 @@ mod tests {
     #[test]
     fn the_transport_works_on_a_restored_song_without_playing_it() {
         use crate::api::models::{PlayableItem, PlaylistItem, Track};
-        use crate::model::PagedList;
+        use crate::model::SparseList;
         let row = |uri: &str| PlaylistItem {
             item: Some(PlayableItem::Track(Track {
                 id: Some(uri.rsplit(':').next().unwrap().into()),
@@ -5856,14 +6135,11 @@ mod tests {
         app.playlist_pages.insert(
             "pl1".into(),
             PlaylistPage {
-                items: PagedList {
-                    items: vec![
-                        row("spotify:track:one"),
-                        row("spotify:track:two"),
-                        row("spotify:track:three"),
-                    ],
-                    ..Default::default()
-                },
+                items: SparseList::from_items(vec![
+                    row("spotify:track:one"),
+                    row("spotify:track:two"),
+                    row("spotify:track:three"),
+                ]),
                 ..Default::default()
             },
         );
@@ -5917,7 +6193,7 @@ mod tests {
     #[test]
     fn skipping_a_restored_song_keeps_shuffle_on() {
         use crate::api::models::{PlayableItem, PlaylistItem, Track};
-        use crate::model::PagedList;
+        use crate::model::SparseList;
         let row = |uri: &str| PlaylistItem {
             item: Some(PlayableItem::Track(Track {
                 uri: uri.into(),
@@ -5930,10 +6206,10 @@ mod tests {
         app.playlist_pages.insert(
             "pl1".into(),
             PlaylistPage {
-                items: PagedList {
-                    items: vec![row("spotify:track:one"), row("spotify:track:two")],
-                    ..Default::default()
-                },
+                items: SparseList::from_items(vec![
+                    row("spotify:track:one"),
+                    row("spotify:track:two"),
+                ]),
                 ..Default::default()
             },
         );
@@ -6916,19 +7192,16 @@ mod tests {
         app.playlist_pages.insert(
             "open".into(),
             PlaylistPage {
-                items: PagedList {
-                    items: vec![
-                        PlaylistItem {
-                            item: track("spotify:track:one"),
-                            ..Default::default()
-                        },
-                        PlaylistItem {
-                            item: track("spotify:track:two"),
-                            ..Default::default()
-                        },
-                    ],
-                    ..Default::default()
-                },
+                items: crate::model::SparseList::from_items(vec![
+                    PlaylistItem {
+                        item: track("spotify:track:one"),
+                        ..Default::default()
+                    },
+                    PlaylistItem {
+                        item: track("spotify:track:two"),
+                        ..Default::default()
+                    },
+                ]),
                 ..Default::default()
             },
         );
@@ -7393,5 +7666,629 @@ mod tests {
                 .iter()
                 .any(|toast| toast.message.starts_with("Gone: "))
         );
+    }
+
+    #[test]
+    fn jump_to_playing_tracked_index() {
+        use crate::api::models::Track;
+        let mut app = headless_app();
+        let ctx = egui::Context::default();
+
+        app.playlist_pages
+            .insert("pl1".into(), PlaylistPage::default());
+        app.open(Page::Playlist("pl1".into()));
+        app.resume_track = Some("spotify:track:target".into());
+        app.track_cache.insert(
+            "target".into(),
+            Track {
+                id: Some("target".into()),
+                uri: "spotify:track:target".into(),
+                ..Default::default()
+            },
+        );
+        app.tracked_play = Some(crate::model::TrackedPlayRow {
+            playlist_id: "pl1".into(),
+            row: 8732,
+            uri: "spotify:track:target".into(),
+        });
+
+        app.apply(Action::JumpToPlayingTrack, &ctx);
+        assert_eq!(
+            app.scroll_to_row,
+            Some((Page::Playlist("pl1".into()), 8732))
+        );
+        assert!(!app.playlist_locator.is_active());
+    }
+
+    #[test]
+    fn jump_to_playing_loaded_page() {
+        use crate::api::models::{PlayableItem, PlaylistItem, Track};
+        use crate::model::SparseList;
+        let mut app = headless_app();
+        let ctx = egui::Context::default();
+
+        let row = |uri: &str| PlaylistItem {
+            item: Some(PlayableItem::Track(Track {
+                uri: uri.into(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        let mut page = PlaylistPage {
+            items: SparseList::new(),
+            ..Default::default()
+        };
+        page.items.set_total(300);
+        let page_1_items: Vec<PlaylistItem> = (100..200)
+            .map(|i| row(&format!("spotify:track:{i}")))
+            .collect();
+        page.items.insert_page(100, page_1_items);
+        app.playlist_pages.insert("pl1".into(), page);
+        app.open(Page::Playlist("pl1".into()));
+
+        app.resume_track = Some("spotify:track:142".into());
+        app.track_cache.insert(
+            "142".into(),
+            Track {
+                id: Some("142".into()),
+                uri: "spotify:track:142".into(),
+                ..Default::default()
+            },
+        );
+
+        app.apply(Action::JumpToPlayingTrack, &ctx);
+        assert_eq!(app.scroll_to_row, Some((Page::Playlist("pl1".into()), 142)));
+        assert!(!app.playlist_locator.is_active());
+    }
+
+    #[test]
+    fn jump_to_playing_external_track_starts_locator() {
+        use crate::api::models::Track;
+        use crate::model::SparseList;
+        let mut app = headless_app();
+        let ctx = egui::Context::default();
+
+        let mut page = PlaylistPage {
+            items: SparseList::new(),
+            ..Default::default()
+        };
+        page.items.set_total(500);
+        app.playlist_pages.insert("pl1".into(), page);
+        app.open(Page::Playlist("pl1".into()));
+
+        app.resume_track = Some("spotify:track:remote".into());
+        app.track_cache.insert(
+            "remote".into(),
+            Track {
+                id: Some("remote".into()),
+                uri: "spotify:track:remote".into(),
+                ..Default::default()
+            },
+        );
+
+        app.apply(Action::JumpToPlayingTrack, &ctx);
+        assert_eq!(app.scroll_to_row, None);
+        assert!(app.playlist_locator.is_active());
+        if let crate::model::PlaylistLocator::Locating {
+            in_flight,
+            target_uri,
+            ..
+        } = &app.playlist_locator
+        {
+            assert_eq!(target_uri, "spotify:track:remote");
+            assert_eq!(in_flight.len(), 2);
+            assert!(in_flight.contains(&0));
+            assert!(in_flight.contains(&1));
+        } else {
+            panic!("Expected locating state");
+        }
+    }
+
+    #[test]
+    fn locator_finds_track_on_first_page() {
+        use crate::api::models::{Page as ApiPage, PlayableItem, PlaylistItem, Track};
+        use crate::model::SparseList;
+        let mut app = headless_app();
+        let ctx = egui::Context::default();
+
+        let mut page = PlaylistPage {
+            items: SparseList::new(),
+            ..Default::default()
+        };
+        page.items.set_total(300);
+        app.playlist_pages.insert("pl1".into(), page);
+        app.open(Page::Playlist("pl1".into()));
+
+        app.resume_track = Some("spotify:track:match".into());
+        app.track_cache.insert(
+            "match".into(),
+            Track {
+                id: Some("match".into()),
+                uri: "spotify:track:match".into(),
+                ..Default::default()
+            },
+        );
+
+        app.apply(Action::JumpToPlayingTrack, &ctx);
+        assert!(app.playlist_locator.is_active());
+
+        // Feed response for page 0 containing target track at index 5
+        let items: Vec<PlaylistItem> = (0..100)
+            .map(|i| PlaylistItem {
+                item: Some(PlayableItem::Track(Track {
+                    uri: if i == 5 {
+                        "spotify:track:match".into()
+                    } else {
+                        format!("spotify:track:other_{i}")
+                    },
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })
+            .collect();
+
+        app.handle_api(ApiResponse::PlaylistItems {
+            id: "pl1".into(),
+            offset: 0,
+            generation: 0,
+            result: Ok(ApiPage {
+                items,
+                total: 300,
+                limit: 100,
+                offset: 0,
+                next: None,
+            }),
+        });
+
+        assert_eq!(app.scroll_to_row, Some((Page::Playlist("pl1".into()), 5)));
+        assert!(!app.playlist_locator.is_active());
+    }
+
+    #[test]
+    fn locator_finds_track_on_middle_page_and_stops() {
+        use crate::api::models::{Page as ApiPage, PlayableItem, PlaylistItem, Track};
+        use crate::model::SparseList;
+        let mut app = headless_app();
+        let ctx = egui::Context::default();
+
+        let mut page = PlaylistPage {
+            items: SparseList::new(),
+            ..Default::default()
+        };
+        page.items.set_total(300);
+        app.playlist_pages.insert("pl1".into(), page);
+        app.open(Page::Playlist("pl1".into()));
+
+        app.resume_track = Some("spotify:track:target".into());
+        app.track_cache.insert(
+            "target".into(),
+            Track {
+                id: Some("target".into()),
+                uri: "spotify:track:target".into(),
+                ..Default::default()
+            },
+        );
+
+        app.apply(Action::JumpToPlayingTrack, &ctx);
+
+        // Page 0 without track
+        let page_0_items: Vec<PlaylistItem> = (0..100)
+            .map(|i| PlaylistItem {
+                item: Some(PlayableItem::Track(Track {
+                    uri: format!("spotify:track:p0_{i}"),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })
+            .collect();
+
+        app.handle_api(ApiResponse::PlaylistItems {
+            id: "pl1".into(),
+            offset: 0,
+            generation: 0,
+            result: Ok(ApiPage {
+                items: page_0_items,
+                total: 300,
+                limit: 100,
+                offset: 0,
+                next: None,
+            }),
+        });
+
+        // Locator should still be active, waiting for remaining pages
+        assert!(app.playlist_locator.is_active());
+        assert_eq!(app.scroll_to_row, None);
+
+        // Page 1 with track at position 15
+        let page_1_items: Vec<PlaylistItem> = (0..100)
+            .map(|i| PlaylistItem {
+                item: Some(PlayableItem::Track(Track {
+                    uri: if i == 15 {
+                        "spotify:track:target".into()
+                    } else {
+                        format!("spotify:track:p1_{i}")
+                    },
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })
+            .collect();
+
+        app.handle_api(ApiResponse::PlaylistItems {
+            id: "pl1".into(),
+            offset: 100,
+            generation: 0,
+            result: Ok(ApiPage {
+                items: page_1_items,
+                total: 300,
+                limit: 100,
+                offset: 100,
+                next: None,
+            }),
+        });
+
+        assert_eq!(app.scroll_to_row, Some((Page::Playlist("pl1".into()), 115)));
+        assert!(!app.playlist_locator.is_active());
+    }
+
+    #[test]
+    fn locator_track_not_found() {
+        use crate::api::models::{Page as ApiPage, PlayableItem, PlaylistItem, Track};
+        use crate::model::SparseList;
+        let mut app = headless_app();
+        let ctx = egui::Context::default();
+
+        let mut page = PlaylistPage {
+            items: SparseList::new(),
+            ..Default::default()
+        };
+        page.items.set_total(150);
+        app.playlist_pages.insert("pl1".into(), page);
+        app.open(Page::Playlist("pl1".into()));
+
+        app.resume_track = Some("spotify:track:absent".into());
+        app.track_cache.insert(
+            "absent".into(),
+            Track {
+                id: Some("absent".into()),
+                uri: "spotify:track:absent".into(),
+                ..Default::default()
+            },
+        );
+
+        app.apply(Action::JumpToPlayingTrack, &ctx);
+
+        let row = |i: usize| PlaylistItem {
+            item: Some(PlayableItem::Track(Track {
+                uri: format!("spotify:track:song_{i}"),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        // Deliver both pages without target
+        app.handle_api(ApiResponse::PlaylistItems {
+            id: "pl1".into(),
+            offset: 0,
+            generation: 0,
+            result: Ok(ApiPage {
+                items: (0..100).map(row).collect(),
+                total: 150,
+                limit: 100,
+                offset: 0,
+                next: None,
+            }),
+        });
+
+        app.handle_api(ApiResponse::PlaylistItems {
+            id: "pl1".into(),
+            offset: 100,
+            generation: 0,
+            result: Ok(ApiPage {
+                items: (100..150).map(row).collect(),
+                total: 150,
+                limit: 100,
+                offset: 100,
+                next: None,
+            }),
+        });
+
+        assert_eq!(app.scroll_to_row, None);
+        assert!(!app.playlist_locator.is_active());
+        assert!(
+            app.toasts
+                .iter()
+                .any(|t| t.message == "Playing track is not in this playlist")
+        );
+    }
+
+    #[test]
+    fn locator_discards_stale_response() {
+        use crate::api::models::Page as ApiPage;
+        let mut app = headless_app();
+        let page = PlaylistPage {
+            generation: 2,
+            ..Default::default()
+        };
+        app.playlist_pages.insert("pl1".into(), page);
+
+        app.handle_api(ApiResponse::PlaylistItems {
+            id: "pl1".into(),
+            offset: 0,
+            generation: 1,
+            result: Ok(ApiPage {
+                items: vec![],
+                total: 10,
+                limit: 100,
+                offset: 0,
+                next: None,
+            }),
+        });
+
+        assert!(!app.playlist_pages["pl1"].items.loaded_once);
+    }
+
+    #[test]
+    fn locator_discards_response_after_playback_change() {
+        use crate::api::models::{Page as ApiPage, PlayableItem, PlaylistItem, Track};
+        use crate::model::SparseList;
+        let mut app = headless_app();
+        let ctx = egui::Context::default();
+
+        let mut page = PlaylistPage {
+            items: SparseList::new(),
+            ..Default::default()
+        };
+        page.items.set_total(200);
+        app.playlist_pages.insert("pl1".into(), page);
+        app.open(Page::Playlist("pl1".into()));
+
+        app.resume_track = Some("spotify:track:song_a".into());
+        app.track_cache.insert(
+            "song_a".into(),
+            Track {
+                id: Some("song_a".into()),
+                uri: "spotify:track:song_a".into(),
+                ..Default::default()
+            },
+        );
+
+        app.apply(Action::JumpToPlayingTrack, &ctx);
+        assert!(app.playlist_locator.is_active());
+
+        // Change playback to song_b
+        app.resume_track = Some("spotify:track:song_b".into());
+        app.track_cache.insert(
+            "song_b".into(),
+            Track {
+                id: Some("song_b".into()),
+                uri: "spotify:track:song_b".into(),
+                ..Default::default()
+            },
+        );
+        app.check_playback_tracking();
+        assert!(!app.playlist_locator.is_active());
+
+        // Response for song_a arrives now
+        let items: Vec<PlaylistItem> = vec![PlaylistItem {
+            item: Some(PlayableItem::Track(Track {
+                uri: "spotify:track:song_a".into(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }];
+
+        app.handle_api(ApiResponse::PlaylistItems {
+            id: "pl1".into(),
+            offset: 0,
+            generation: 0,
+            result: Ok(ApiPage {
+                items,
+                total: 200,
+                limit: 100,
+                offset: 0,
+                next: None,
+            }),
+        });
+
+        // Must NOT scroll to song_a
+        assert_eq!(app.scroll_to_row, None);
+    }
+
+    #[test]
+    fn locator_discards_response_after_playlist_change() {
+        use crate::api::models::Track;
+        use crate::model::SparseList;
+        let mut app = headless_app();
+        let ctx = egui::Context::default();
+
+        let mut page = PlaylistPage {
+            items: SparseList::new(),
+            ..Default::default()
+        };
+        page.items.set_total(200);
+        app.playlist_pages.insert("pl1".into(), page);
+        app.open(Page::Playlist("pl1".into()));
+
+        app.resume_track = Some("spotify:track:search".into());
+        app.track_cache.insert(
+            "search".into(),
+            Track {
+                id: Some("search".into()),
+                uri: "spotify:track:search".into(),
+                ..Default::default()
+            },
+        );
+
+        app.apply(Action::JumpToPlayingTrack, &ctx);
+        assert!(app.playlist_locator.is_active());
+
+        // Navigate away to Home
+        app.open(Page::Home);
+        assert!(!app.playlist_locator.is_active());
+    }
+
+    #[test]
+    fn locator_does_not_duplicate_page_requests() {
+        use crate::api::models::{PlayableItem, PlaylistItem, Track};
+        use crate::model::SparseList;
+        let mut app = headless_app();
+        let ctx = egui::Context::default();
+
+        let row = |uri: &str| PlaylistItem {
+            item: Some(PlayableItem::Track(Track {
+                uri: uri.into(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        let mut page = PlaylistPage {
+            items: SparseList::new(),
+            ..Default::default()
+        };
+        page.items.set_total(500);
+        // Page 0 already loaded
+        page.items
+            .insert_page(0, (0..100).map(|i| row(&format!("t:{i}"))).collect());
+        app.playlist_pages.insert("pl1".into(), page);
+        app.open(Page::Playlist("pl1".into()));
+
+        app.resume_track = Some("spotify:track:target".into());
+        app.track_cache.insert(
+            "target".into(),
+            Track {
+                id: Some("target".into()),
+                uri: "spotify:track:target".into(),
+                ..Default::default()
+            },
+        );
+
+        app.apply(Action::JumpToPlayingTrack, &ctx);
+
+        if let crate::model::PlaylistLocator::Locating {
+            in_flight,
+            checked_pages,
+            ..
+        } = &app.playlist_locator
+        {
+            // Page 0 was already checked/loaded, so it must not be in in_flight
+            assert!(checked_pages.contains(&0));
+            assert!(!in_flight.contains(&0));
+            // Pages 1 and 2 requested instead
+            assert!(in_flight.contains(&1));
+            assert!(in_flight.contains(&2));
+            assert_eq!(in_flight.len(), 2);
+        } else {
+            panic!("Expected Locating state");
+        }
+    }
+
+    #[test]
+    fn tracked_row_stale_identity_falls_back_to_locator() {
+        use crate::api::models::{PlayableItem, PlaylistItem, Track};
+        use crate::model::SparseList;
+        let mut app = headless_app();
+        let ctx = egui::Context::default();
+
+        let row = |uri: &str| PlaylistItem {
+            item: Some(PlayableItem::Track(Track {
+                uri: uri.into(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        let mut page = PlaylistPage {
+            items: SparseList::new(),
+            ..Default::default()
+        };
+        page.items.set_total(300);
+        page.items.insert_page(
+            0,
+            (0..100)
+                .map(|i| row(&format!("spotify:track:other_{i}")))
+                .collect(),
+        );
+        app.playlist_pages.insert("pl1".into(), page);
+        app.open(Page::Playlist("pl1".into()));
+
+        app.resume_track = Some("spotify:track:target".into());
+        app.track_cache.insert(
+            "target".into(),
+            Track {
+                id: Some("target".into()),
+                uri: "spotify:track:target".into(),
+                ..Default::default()
+            },
+        );
+        app.tracked_play = Some(crate::model::TrackedPlayRow {
+            playlist_id: "pl1".into(),
+            row: 50,
+            uri: "spotify:track:target".into(),
+        });
+
+        app.apply(Action::JumpToPlayingTrack, &ctx);
+        assert_eq!(app.scroll_to_row, None);
+        assert_eq!(app.tracked_play, None);
+        assert!(app.playlist_locator.is_active());
+    }
+
+    #[test]
+    fn locator_repeated_jump_clicks_are_idempotent() {
+        use crate::api::models::Track;
+        use crate::model::SparseList;
+        let mut app = headless_app();
+        let ctx = egui::Context::default();
+
+        let mut page = PlaylistPage {
+            items: SparseList::new(),
+            ..Default::default()
+        };
+        page.items.set_total(1000);
+        app.playlist_pages.insert("pl1".into(), page);
+        app.open(Page::Playlist("pl1".into()));
+
+        app.resume_track = Some("spotify:track:target".into());
+        app.track_cache.insert(
+            "target".into(),
+            Track {
+                id: Some("target".into()),
+                uri: "spotify:track:target".into(),
+                ..Default::default()
+            },
+        );
+
+        // Click jump first time: starts locator and requests pages 0 and 1
+        app.apply(Action::JumpToPlayingTrack, &ctx);
+        let gen1 = if let crate::model::PlaylistLocator::Locating {
+            locator_generation,
+            in_flight,
+            ..
+        } = &app.playlist_locator
+        {
+            assert_eq!(in_flight.len(), 2);
+            *locator_generation
+        } else {
+            panic!("Expected locating state");
+        };
+
+        // Click jump 5 more times rapidly: must NOT reset in_flight or increment locator_generation
+        for _ in 0..5 {
+            app.apply(Action::JumpToPlayingTrack, &ctx);
+        }
+
+        if let crate::model::PlaylistLocator::Locating {
+            locator_generation,
+            in_flight,
+            ..
+        } = &app.playlist_locator
+        {
+            assert_eq!(*locator_generation, gen1);
+            assert_eq!(in_flight.len(), 2);
+        } else {
+            panic!("Expected locating state");
+        }
     }
 }

@@ -24,7 +24,7 @@ use crate::player::{Engine, EngineConfig, EngineEvent, LoadSpec, LocalState, Pla
 pub type ApiResult<T> = Result<T, ApiError>;
 
 const PREMIUM_NEEDED: &str = "Local playback needs Spotify Premium.";
-pub const PLAYLIST_PAGE_SIZE: u32 = 50;
+pub const PLAYLIST_PAGE_SIZE: u32 = 100;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AuthStatus {
