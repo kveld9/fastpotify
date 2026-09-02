@@ -451,20 +451,11 @@ impl<T> SparseList<T> {
             let mut all = self.to_vec();
             all.retain(|item| f(item));
             self.set_cached(all);
-            return;
-        }
-        let mut removed = 0;
-        for page in self.pages.iter_mut().flatten() {
-            let before = page.len();
-            page.retain(|item| f(item));
-            removed += before - page.len();
-        }
-        if removed > 0 {
-            self.loaded_count = self.loaded_count.saturating_sub(removed);
-            if let Some(total) = self.total.as_mut() {
-                *total = total.saturating_sub(removed as u32);
-            }
-            self.revision = self.revision.wrapping_add(1);
+        } else {
+            // Deleting items in an incomplete sparse list shifts global indices across
+            // page boundaries, corrupting the fixed-stride arithmetic (index / 100).
+            // Clear pages to reload from the canonical API state.
+            self.reset();
         }
     }
 
@@ -495,6 +486,10 @@ impl<T> SparseList<T> {
                 page.insert(insert_at.min(page.len()), item);
                 self.revision = self.revision.wrapping_add(1);
             }
+        } else {
+            // Cross-page move across unknown holes cannot shift in-flight slices accurately.
+            // Reset to reload from the canonical API state.
+            self.reset();
         }
     }
 
@@ -1167,28 +1162,27 @@ mod tests {
     }
 
     #[test]
-    fn sparse_list_retain_preserves_unloaded_pages() {
+    fn sparse_list_retain_when_incomplete_resets_to_prevent_stride_corruption() {
         let mut list: SparseList<String> = SparseList::new();
         list.set_total(500);
         list.insert_page(0, vec!["keep".into(), "drop".into(), "keep2".into()]);
-        list.insert_page(400, vec!["p4_keep".into(), "drop".into()]);
+        list.insert_page(400, vec!["p4_keep".into()]);
 
-        assert_eq!(list.pages.len(), 5);
-        assert!(list.is_missing(1));
-        assert!(list.is_missing(2));
-        assert!(list.is_missing(3));
-
-        // Retain on sparse list must NOT collapse or erase missing pages!
+        // When incomplete, retain must reset to avoid producing 99-item stride corruption
         list.retain(|s| s != "drop");
+        assert_eq!(list.loaded_count, 0);
+        assert!(!list.loaded_once);
+    }
 
-        assert_eq!(list.pages.len(), 5);
-        assert!(list.is_missing(1));
-        assert!(list.is_missing(2));
-        assert!(list.is_missing(3));
-        assert_eq!(list.get(0), Some(&"keep".to_string()));
-        assert_eq!(list.get(1), Some(&"keep2".to_string()));
-        assert_eq!(list.get(400), Some(&"p4_keep".to_string()));
-        assert_eq!(list.total, Some(498));
+    #[test]
+    fn sparse_list_retain_when_complete_repacks_cleanly() {
+        let mut list: SparseList<String> = SparseList::new();
+        list.set_cached(vec!["keep".into(), "drop".into(), "keep2".into()]);
+        assert!(list.is_complete());
+
+        list.retain(|s| s != "drop");
+        assert!(list.is_complete());
+        assert_eq!(list.to_vec(), vec!["keep".to_string(), "keep2".to_string()]);
     }
 
     #[test]
@@ -1212,5 +1206,18 @@ mod tests {
         assert_eq!(list.get(1), Some(&"c".to_string()));
         assert_eq!(list.get(2), Some(&"a".to_string()));
         assert_eq!(list.get(300), Some(&"p3".to_string()));
+    }
+
+    #[test]
+    fn sparse_list_reorder_cross_page_when_incomplete_resets_to_prevent_corruption() {
+        let mut list: SparseList<String> = SparseList::new();
+        list.set_total(500);
+        list.insert_page(0, vec!["a".into()]);
+        list.insert_page(300, vec!["p3".into()]);
+
+        // Cross page reorder across unknown holes must reset
+        list.reorder(0, 301);
+        assert_eq!(list.loaded_count, 0);
+        assert!(!list.loaded_once);
     }
 }

@@ -216,6 +216,7 @@ pub fn actions_row(
             }
         }
         if let Some(uri) = &actions.play_uri
+            && matches!(app.page(), Page::Playlist(_))
             && app.playing_context_uri().as_deref() == Some(uri.as_str())
         {
             if app.playlist_locator.is_active() {
@@ -644,11 +645,15 @@ pub fn table(app: &mut App, ui: &mut egui::Ui, table: Table<'_>) {
         );
     } else if entry.visible.is_empty()
         && !needle.is_empty()
-        && table.can_load_more
         && !table.loading
+        && table.error.is_none()
     {
-        // Filtering a partially loaded list: keep fetching so matches appear.
-        app.actions.push(Action::LoadMore(table.page));
+        ui.add_space(32.0);
+        if table.can_load_more {
+            theme::subtle(ui, &palette, "No matches found in loaded songs");
+        } else {
+            theme::subtle(ui, &palette, "No matches found");
+        }
     } else {
         widgets::load_more_when_near_end(
             ui,

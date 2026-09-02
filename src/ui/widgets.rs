@@ -1623,24 +1623,33 @@ pub fn skeleton_track_row(
     number: usize,
     show_cover: bool,
 ) {
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), row_height), Sense::hover());
+    let width = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(vec2(width, row_height), Sense::hover());
     if !ui.is_rect_visible(rect) {
         return;
     }
     let painter = ui.painter();
+    let num_col_width = 44.0;
+    let cover_col_width = if show_cover { 52.0 } else { 0.0 };
+
+    let mut x = rect.left() + 8.0;
+
+    // Number column: right-aligned exactly as in track_row (x + cols.number - 12.0)
     let num_text = (number + 1).to_string();
     painter.text(
-        pos2(rect.left() + 24.0, rect.center().y),
+        pos2(x + num_col_width - 12.0, rect.center().y),
         egui::Align2::RIGHT_CENTER,
         num_text,
         theme::regular(13.0),
         palette.dim.gamma_multiply(0.4),
     );
-    let mut x = rect.left() + 36.0;
+    x += num_col_width;
+
+    // Cover placeholder: positioned at exact same X offset and size as track_row
     if show_cover {
         let cover_size = (row_height - 12.0).clamp(16.0, 40.0);
         let cover_rect = Rect::from_min_size(
-            pos2(x + 4.0, rect.top() + (row_height - cover_size) / 2.0),
+            pos2(x, rect.top() + (row_height - cover_size) / 2.0),
             vec2(cover_size, cover_size),
         );
         painter.rect_filled(
@@ -1648,11 +1657,13 @@ pub fn skeleton_track_row(
             CornerRadius::same(4),
             palette.surface.gamma_multiply(0.5),
         );
-        x += cover_size + 12.0;
+        x += cover_col_width;
     }
+
+    // Title bar placeholder: starts at the exact X offset of the track title
     let bar_rect = Rect::from_min_size(
-        pos2(x + 8.0, rect.center().y - 6.0),
-        vec2((ui.available_width() * 0.25).clamp(80.0, 240.0), 12.0),
+        pos2(x, rect.center().y - 6.0),
+        vec2((width * 0.25).clamp(80.0, 240.0), 12.0),
     );
     painter.rect_filled(
         bar_rect,
